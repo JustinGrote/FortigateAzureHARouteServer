@@ -361,20 +361,35 @@ config router bgp
           set soft-reconfiguration enable
           set interface "port2"
           set remote-as {1}
-          {4}
       next
       edit "{3}"
           set ebgp-enforce-multihop enable
           set soft-reconfiguration enable
           set interface "port2"
           set remote-as {1}
-          {4}
       next
   end
 end
+
+config router static
+  edit 1
+    set comment "Azure Route Server BGP Peers"
+    set dst {4}
+    set device port2
+    set gateway {5}
+  next
+end
+
 '''
 
-var fortigateABgpConfig = format(fortigateBgpConfigTemplate, FortigateBgpAsn, routeserver.outputs.asn, routeserver.outputs.routerA, routeserver.outputs.routerB, null)
+//Get the gateway IP from the subnet prefix, assuming it's the first IP as all azure routers are
+var IPArray = split(InternalSubnetPrefix, [
+  '/'
+  '.'
+])
+var gatewayIP = '${IPArray[0]}.${IPArray[1]}.${IPArray[2]}.${int(IPArray[3]) + 1}'
+
+var fortigateBgpConfig = format(fortigateBgpConfigTemplate, FortigateBgpAsn, routeserver.outputs.asn, routeserver.outputs.routerA, routeserver.outputs.routerB, RouteServerSubnetPrefix, gatewayIP)
 
 var secondaryConfigTemplate = '''
 config router route-map
@@ -397,9 +412,14 @@ config router bgp
     next
   end
 end
+
 '''
-var secondaryConfig = format(secondaryConfigTemplate,FortigateBgpAsn,routeserver.outputs.routerA,routeserver.outputs.routerB)
-var fortigateBBgpConfig = format(fortigateBgpConfigTemplate, FortigateBgpAsn, routeserver.outputs.asn, routeserver.outputs.routerA, routeserver.outputs.routerB, secondaryConfig)
+
+
+
+var secondaryConfig = format(secondaryConfigTemplate, FortigateBgpAsn, routeserver.outputs.routerA, routeserver.outputs.routerB)
+var fortigateSecondaryBgpConfig = '${fortigateBgpConfig}\n${secondaryConfig}'
+
 
 module fortigateA 'fortigate.bicep' = {
   name: '${deploymentName}-fortigateA'
@@ -421,7 +441,7 @@ module fortigateA 'fortigate.bicep' = {
     FortigateImageVersion: FgVersion
     FortimanagerFqdn: FortimanagerFqdn
     FortimanagerPassword: FortimanagerPassword
-    FortiGateAdditionalConfig: fortigateABgpConfig
+    FortiGateAdditionalConfig: fortigateBgpConfig
     AdminNsgId: fgAdminNsg.id
     AvailabilitySetId: empty(fgSet.id) ? fgSet.id : ''
     ExternalSubnet: externalSubnetInfo
@@ -449,7 +469,7 @@ module fortigateB 'fortigate.bicep' = {
     FortigateImageVersion: FgVersion
     FortimanagerFqdn: FortimanagerFqdn
     FortimanagerPassword: FortimanagerPassword
-    FortiGateAdditionalConfig: fortigateBBgpConfig
+    FortiGateAdditionalConfig: fortigateSecondaryBgpConfig
     AdminNsgId: fgAdminNsg.id
     AvailabilitySetId: empty(fgSet.id) ? fgSet.id : ''
     ExternalSubnet: externalSubnetInfo
@@ -478,3 +498,6 @@ module fortigateB 'fortigate.bicep' = {
 
 // output fgaFortimanagerSharedKeyCommand string = fortigateA.outputs.fortimanagerSharedKey
 // output fgbFortimanagerSharedKeyCommand string = fortigateB.outputs.fortimanagerSharedKey
+
+
+output secondaryConfig string = secondaryConfig
