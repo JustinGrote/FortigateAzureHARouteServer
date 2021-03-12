@@ -1,4 +1,4 @@
-targetScope = 'resourceGroup' 
+targetScope = 'resourceGroup'
 // Mandatory Parameters
 @secure()
 @description('Password for the user defined by AdminUsername')
@@ -39,9 +39,6 @@ param FgVersion string = 'latest'
 @description('Specify an alternate VM size. The VM size must allow for at least two NICs, and four are recommended')
 param VmSize string = 'Standard_DS3_v2'
 
-@description('IP address of the internal load balancer port. This normally does not need to be configured but it is where all traffic flows to via the route table rule')
-param LbInternalSubnetIP string = ''
-
 @description('The port to use for accessing the http management interface of the first Fortigate')
 param FgaManagementHttpPort int = 50443
 
@@ -76,7 +73,8 @@ param FortinetTags object = {
   provider: '6EB3B02F-50E5-4A3E-8CB8-2E129258317D'
 }
 
-
+@description('Add a random suffix to names that must be regionally unique, such as DNS names or storage accounts')
+param RegionUniqueNames bool = false
 
 // New vNet Scenario parameters
 @description('vNet Address Prefixes to allocate to the vNet')
@@ -93,6 +91,16 @@ param InternalSubnetPrefix string = '10.0.2.0/24'
 // Existing vNet Scenario parameters
 @description('Specify the name of an existing vnet within the subscription to use. You must specify the internalSubnetName and externalSubnetName options if you specify this option, as well as vnetResourceGroupName if the vnet is not in the same resource group as this deployment')
 param ExistingVNetId string = ''
+
+//Route Server Scenario
+@description('Deploy an Azure Route Server for internal BGP communication to the vnet')
+param UseRouteServer bool = false
+
+@description('IP Range to use for the RouteServerSubnet. If it exists in the vnet the existing will be used')
+param RouteServerSubnetPrefix string = '10.0.0.64/27'
+
+@description('BGP ASN to use for the fortigate firewalls. Defaults to 65515')
+param FortigateBgpAsn int = 65511
 
 var deploymentName = deployment().name
 
@@ -160,6 +168,18 @@ module network 'network.bicep' = if (empty(ExistingVNetId)) {
     ExternalSubnetPrefix: ExternalSubnetPrefix
     InternalSubnetName: InternalSubnetName
     ExternalSubnetName: ExternalSubnetName
+    RouteServerSubnetPrefix: RouteServerSubnetPrefix
+  }
+}
+
+//This is a module because we need to retrieve the peering IPs and ASN for the fortigate config
+module routeserver 'routeserver.bicep' = {
+  name: '${deploymentName}-routeserver'
+  params: {
+    RouteServerName: FgNamePrefix
+    Location: Location
+    // TODO: Specify alternate vnet via external resource
+    RouteServerSubnetId: resourceId('Microsoft.Network/virtualNetworks/subnets', FgNamePrefix, 'RouteServerSubnet')
   }
 }
 
@@ -174,34 +194,226 @@ var externalSubnetInfo = {
 
 var externalSubnetId = empty(ExistingVNetId) ? network.outputs.externalSubnet.id : '${ExistingVNetId}/subnets/${ExternalSubnetName}'
 
-module loadbalancer './loadbalancer.bicep' = {
-  name: '${deploymentName}-loadbalancer'
-  params: {
-    LbName: FgNamePrefix
-    FgaManagementHttpPort: FgaManagementHttpPort
-    FgaManagementSshPort: FgaManagementSshPort
-    FgbManagementHttpPort: FgbManagementHttpPort
-    FgbManagementSshPort: FgbManagementSshPort
-    InternalSubnetId: internalSubnetInfo.id
-    PublicIPID: PublicIPID
-    LbInternalSubnetIP: LbInternalSubnetIP
+var LbName = FgNamePrefix
+var LbDnsName = RegionUniqueNames ? toLower('${LbName}-${substring(uniqueString(LbName), 0, 4)}') : toLower('${LbName}')
+resource pip 'Microsoft.Network/publicIPAddresses@2020-05-01' = if (empty(PublicIPID)) {
+  name: LbName
+  location: Location
+  tags: {
+    provider: toUpper(FortinetTags.provider)
+  }
+  sku: {
+    name: 'Standard'
+  }
+  properties: {
+    publicIPAllocationMethod: 'Static'
+    dnsSettings: {
+      domainNameLabel: LbDnsName
+    }
+  }
+}
+
+resource externalLB 'Microsoft.Network/loadBalancers@2020-05-01' = {
+  name: FgNamePrefix
+  location: Location
+  tags: {
+    provider: toUpper(FortinetTags.provider)
+  }
+  sku: {
+    name: 'Standard'
+  }
+  properties: {
+    frontendIPConfigurations: [
+      {
+        name: 'default'
+        properties: {
+          publicIPAddress: {
+            id: empty(PublicIPID) ? pip.id : PublicIPID
+          }
+        }
+      }
+    ]
+    backendAddressPools: [
+      {
+        name: 'default'
+      }
+    ]
+    loadBalancingRules: []
+    outboundRules: [
+      {
+        name: 'default'
+        properties: {
+          allocatedOutboundPorts: 0
+          protocol: 'All'
+          enableTcpReset: true
+          idleTimeoutInMinutes: 4
+          backendAddressPool: {
+            id: resourceId('Microsoft.Network/loadBalancers/backendAddressPools', LbName, 'default')
+          }
+          frontendIPConfigurations: [
+            {
+              id: resourceId('Microsoft.Network/loadBalancers/frontendIPConfigurations', LbName, 'default')
+            }
+          ]
+        }
+      }
+    ]
+    inboundNatRules: [
+      {
+        name: 'default'
+        properties: {
+          frontendIPConfiguration: {
+            id: resourceId('Microsoft.Network/loadBalancers/frontendIPConfigurations', LbName, 'default')
+          }
+          protocol: 'Tcp'
+          frontendPort: FgaManagementSshPort
+          backendPort: 22
+          enableFloatingIP: false
+        }
+      }
+      {
+        name: '${LbName}A-Management-HTTPS'
+        properties: {
+          frontendIPConfiguration: {
+            id: resourceId('Microsoft.Network/loadBalancers/frontendIPConfigurations', LbName, 'default')
+          }
+          protocol: 'Tcp'
+          frontendPort: FgaManagementHttpPort
+          backendPort: 443
+          enableFloatingIP: false
+        }
+      }
+      {
+        name: '${LbName}B-Management-SSH'
+        properties: {
+          frontendIPConfiguration: {
+            id: resourceId('Microsoft.Network/loadBalancers/frontendIPConfigurations', LbName, 'default')
+          }
+          protocol: 'Tcp'
+          frontendPort: FgbManagementSshPort
+          backendPort: 22
+          enableFloatingIP: false
+        }
+      }
+      {
+        name: '${LbName}B-Management-HTTPS'
+        properties: {
+          frontendIPConfiguration: {
+            id: resourceId('Microsoft.Network/loadBalancers/frontendIPConfigurations', LbName, 'default')
+          }
+          protocol: 'Tcp'
+          frontendPort: FgbManagementHttpPort
+          backendPort: 443
+          enableFloatingIP: false
+        }
+      }
+    ]
+    probes: [
+      {
+        properties: {
+          protocol: 'Tcp'
+          port: 8008
+          intervalInSeconds: 5
+          numberOfProbes: 2
+        }
+        name: 'lbprobe'
+      }
+    ]
   }
 }
 
 var fgImageSku = BringYourOwnLicense ? 'fortinet_fg-vm' : 'fortinet_fg-vm_payg_20190624'
+
+var fortigateALoadBalancerInfo = {
+  externalBackendId: externalLB.properties.backendAddressPools[0].id
+  natrules: [
+    {
+      id: externalLB.properties.inboundNatRules[0].id
+    }
+    {
+      id: externalLB.properties.inboundNatRules[1].id
+    }
+  ]
+}
+
+var fortigateBLoadBalancerInfo = {
+  externalBackendId: externalLB.properties.backendAddressPools[0].id
+  natrules: [
+    {
+      id: externalLB.properties.inboundNatRules[2].id
+    }
+    {
+      id: externalLB.properties.inboundNatRules[3].id
+    }
+  ]
+}
+
+var fortigateBgpConfigTemplate = '''
+config router bgp
+  set as {0}
+  set keepalive-timer 1
+  set holdtime-timer 3
+  set ebgp-multipath enable
+  set graceful-restart enable
+  config neighbor
+      edit "{2}"
+          set ebgp-enforce-multihop enable
+          set soft-reconfiguration enable
+          set interface "port2"
+          set remote-as {1}
+          {4}
+      next
+      edit "{3}"
+          set ebgp-enforce-multihop enable
+          set soft-reconfiguration enable
+          set interface "port2"
+          set remote-as {1}
+          {4}
+      next
+  end
+end
+'''
+
+var fortigateABgpConfig = format(fortigateBgpConfigTemplate, FortigateBgpAsn, routeserver.outputs.asn, routeserver.outputs.routerA, routeserver.outputs.routerB, null)
+
+var secondaryConfigTemplate = '''
+config router route-map
+  edit "SecondaryPath"
+    config rule
+      edit 1
+        set set-aspath "{0} {0} {0}"                        
+      next
+    end
+  next
+end
+
+config router bgp
+  config neighbor
+    edit "{1}"
+      set route-map-out "SecondaryPath"
+    next
+    edit "{2}"
+      set route-map-out "SecondaryPath"
+    next
+  end
+end
+'''
+var secondaryConfig = format(secondaryConfigTemplate,FortigateBgpAsn,routeserver.outputs.routerA,routeserver.outputs.routerB)
+var fortigateBBgpConfig = format(fortigateBgpConfigTemplate, FortigateBgpAsn, routeserver.outputs.asn, routeserver.outputs.routerA, routeserver.outputs.routerB, secondaryConfig)
 
 module fortigateA 'fortigate.bicep' = {
   name: '${deploymentName}-fortigateA'
   params: {
     //Fortigate Instance-Specific Parameters
     VmName: '${FgNamePrefix}A'
-    LoadBalancerInfo: loadbalancer.outputs.fortigateALoadBalancerInfo
+    LoadBalancerInfo: fortigateALoadBalancerInfo
     ExternalSubnetIP: !empty(FgaExternalSubnetIP) ? FgaExternalSubnetIP : ''
     InternalSubnetIP: !empty(FgaInternalSubnetIP) ? FgaInternalSubnetIP : ''
 
     //Fortigate Common Parameters
     Location: Location
     VmSize: VmSize
+    RegionUniqueNames: RegionUniqueNames
     AdminUsername: AdminUsername
     AdminPassword: AdminPassword
     AdminSshPublicKeyId: AdminSshPublicKeyId
@@ -209,6 +421,7 @@ module fortigateA 'fortigate.bicep' = {
     FortigateImageVersion: FgVersion
     FortimanagerFqdn: FortimanagerFqdn
     FortimanagerPassword: FortimanagerPassword
+    FortiGateAdditionalConfig: fortigateABgpConfig
     AdminNsgId: fgAdminNsg.id
     AvailabilitySetId: empty(fgSet.id) ? fgSet.id : ''
     ExternalSubnet: externalSubnetInfo
@@ -221,13 +434,14 @@ module fortigateB 'fortigate.bicep' = {
   params: {
     //Fortigate Instance-Specific Parameters
     VmName: '${FgNamePrefix}B'
-    LoadBalancerInfo: loadbalancer.outputs.fortigateBLoadBalancerInfo
+    LoadBalancerInfo: fortigateBLoadBalancerInfo
     ExternalSubnetIP: !empty(FgbExternalSubnetIP) ? FgbExternalSubnetIP : ''
     InternalSubnetIP: !empty(FgbInternalSubnetIP) ? FgbInternalSubnetIP : ''
 
     //Fortigate Common Parameters
     Location: Location
     VmSize: VmSize
+    RegionUniqueNames: RegionUniqueNames
     AdminUsername: AdminUsername
     AdminPassword: AdminPassword
     AdminSshPublicKeyId: AdminSshPublicKeyId
@@ -235,6 +449,7 @@ module fortigateB 'fortigate.bicep' = {
     FortigateImageVersion: FgVersion
     FortimanagerFqdn: FortimanagerFqdn
     FortimanagerPassword: FortimanagerPassword
+    FortiGateAdditionalConfig: fortigateBBgpConfig
     AdminNsgId: fgAdminNsg.id
     AvailabilitySetId: empty(fgSet.id) ? fgSet.id : ''
     ExternalSubnet: externalSubnetInfo
@@ -242,24 +457,24 @@ module fortigateB 'fortigate.bicep' = {
   }
 }
 
-var fqdn = loadbalancer.outputs.publicIpFqdn
-var baseUri = 'https://${fqdn}'
-var baseSsh = 'ssh ${AdminUsername}@${fqdn}'
-output fgManagementUser string = AdminUsername
-output fgaManagementUri string = '${baseUri}:${FgaManagementHttpPort}'
-output fgbManagementUri string = '${baseUri}:${FgbManagementHttpPort}'
-output fgaManagementSshCommand string = '${baseSsh} -p ${FgaManagementSshPort}' 
-output fgbManagementSshCommand string = '${baseSsh} -p ${FgbManagementSshPort}'
+// var fqdn = loadbalancer.outputs.publicIpFqdn
+// var baseUri = 'https://${fqdn}'
+// var baseSsh = 'ssh ${AdminUsername}@${fqdn}'
+// output fgManagementUser string = AdminUsername
+// output fgaManagementUri string = '${baseUri}:${FgaManagementHttpPort}'
+// output fgbManagementUri string = '${baseUri}:${FgbManagementHttpPort}'
+// output fgaManagementSshCommand string = '${baseSsh} -p ${FgaManagementSshPort}' 
+// output fgbManagementSshCommand string = '${baseSsh} -p ${FgbManagementSshPort}'
 
-var fgManagementSSHConfigTemplate = '''
+// var fgManagementSSHConfigTemplate = '''
 
-Host {0}  
-  HostName {1}
-  Port {2}
-  User {3}
-'''
-output fgaManagementSSHConfig string = format(fgManagementSSHConfigTemplate, fortigateA.outputs.fgName, fqdn, FgaManagementSshPort, AdminUsername)
-output fgbManagementSSHConfig string = format(fgManagementSSHConfigTemplate, fortigateB.outputs.fgName, fqdn, FgbManagementSshPort, AdminUsername)
+// Host {0}  
+//   HostName {1}
+//   Port {2}
+//   User {3}
+// '''
+// output fgaManagementSSHConfig string = format(fgManagementSSHConfigTemplate, fortigateA.outputs.fgName, fqdn, FgaManagementSshPort, AdminUsername)
+// output fgbManagementSSHConfig string = format(fgManagementSSHConfigTemplate, fortigateB.outputs.fgName, fqdn, FgbManagementSshPort, AdminUsername)
 
-output fgaFortimanagerSharedKeyCommand string = fortigateA.outputs.fortimanagerSharedKey
-output fgbFortimanagerSharedKeyCommand string = fortigateB.outputs.fortimanagerSharedKey
+// output fgaFortimanagerSharedKeyCommand string = fortigateA.outputs.fortimanagerSharedKey
+// output fgbFortimanagerSharedKeyCommand string = fortigateB.outputs.fortimanagerSharedKey

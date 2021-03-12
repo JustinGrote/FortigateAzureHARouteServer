@@ -66,7 +66,7 @@ param InternalSubnetIP string = ''
 @description('Availability Set that the fortigate should belong to')
 param AvailabilitySetId string = ''
 
-var vmDiagnosticStorageName = toLower(VmName)
+param RegionUniqueNames bool = false
 
 resource nic1 'Microsoft.Network/networkInterfaces@2020-05-01' = {
   name: '${VmName}-port1'
@@ -124,11 +124,6 @@ resource nic2 'Microsoft.Network/networkInterfaces@2020-05-01' = {
           subnet: {
             id: InternalSubnet.Id
           }
-          loadBalancerBackendAddressPools: [
-            {
-              id: LoadBalancerInfo.internalBackendId
-            }
-          ]
         }
       }
     ]
@@ -137,6 +132,7 @@ resource nic2 'Microsoft.Network/networkInterfaces@2020-05-01' = {
   }
 }
 
+var vmDiagnosticStorageName = toLower(VmName)
 resource diagStorage 'Microsoft.Storage/storageAccounts@2019-06-01' = {
   name: vmDiagnosticStorageName
   location: Location
@@ -283,3 +279,5 @@ resource vmFortigate 'Microsoft.Compute/virtualMachines@2019-07-01' = {
 
 output fgName string = VmName
 output fortimanagerSharedKey string = empty(FortimanagerPassword) ? 'execute device replace pw ${VmName} ${fmPassword}' : 'Password was supplied via FortimanagerFqdn parameter and not displayed here' 
+output fgExternalIP string = nic1.properties.ipConfigurations[0].properties.privateIPAddress
+output fgInternalIP string = nic2.properties.ipConfigurations[0].properties.privateIPAddress

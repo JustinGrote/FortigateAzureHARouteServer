@@ -1,5 +1,6 @@
 param VnetName string = resourceGroup().name
 param Location string = resourceGroup().location
+param RouteServerSubnetPrefix string
 
 @description('Virtual Network Address prefix')
 param VnetAddressPrefixes array = [
@@ -38,9 +39,16 @@ resource vnet 'Microsoft.Network/virtualNetworks@2020-05-01' = {
           addressPrefix: InternalSubnetPrefix
         }
       }
+      {
+        name: 'RouteServerSubnet'
+        properties: {
+          addressPrefix: RouteServerSubnetPrefix
+        }
+      }
     ]
   }
 }
 
 output externalSubnet object = vnet.properties.subnets[0]
 output internalSubnet object = vnet.properties.subnets[1]
+output routeServerSubnet object = vnet.properties.subnets[2]

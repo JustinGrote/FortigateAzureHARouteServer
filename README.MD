@@ -1,4 +1,4 @@
-# Fortigate Azure Load-Balancing HA Bicep Template
+# Fortigate Azure Load-Balancing HA with Azure Route Server
 
 This is a reimplementation of the [Fortigate Azure Load-Balancing HA](https://github.com/fortinetsolutions/Azure-Templates/tree/master/FortiGate/Azure%20Active-Active%20LoadBalancer%20HA-Ports) ARM template in bicep format, with significant improvements and cleanup.
 
